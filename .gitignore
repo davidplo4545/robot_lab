@@ -1,0 +1,9 @@
+# Upload only Python scripts
+*
+!*/
+!*.py
+!.gitignore
+__pycache__/
+test_env/
+mujoco_menagerie/
+franka_msgs_ws/
