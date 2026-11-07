@@ -8,6 +8,7 @@ Usage:
   python3 franka_moveit_client.py
   python3 franka_moveit_client.py --ros-args -p group:=fr3_arm -p ee_link:=fr3_hand_tcp
 """
+import math
 import threading
 import time
 
@@ -21,8 +22,12 @@ from moveit_msgs.action import ExecuteTrajectory, MoveGroup
 from moveit_msgs.msg import (BoundingVolume, Constraints, JointConstraint, MoveItErrorCodes,
                              OrientationConstraint, PositionConstraint)
 from moveit_msgs.srv import GetCartesianPath
+from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from tf2_ros import Buffer, TransformListener
+from trajectory_msgs.msg import JointTrajectoryPoint
+
+from orbit_planner import AXES, plan_orbit, time_trajectory
 
 try:  # gripper actions; the arm still works without them
     from franka_msgs.action import Grasp, Homing
@@ -36,10 +41,18 @@ except ImportError:
     torch = None
 
 # Safe workspace box in metres, relative to the robot base. Tighten as needed.
-WORKSPACE = {'x': (0.30, 0.70), 'y': (-0.30, 0.30), 'z': (0.10, 0.70)}
+WORKSPACE = {'x': (0.30, 0.75), 'y': (-0.30, 0.30), 'z': (0.10, 0.70)}
 
 # Franka's standard "ready" pose (radians, joints 1-7): arm bent, gripper down, far from singularities.
 READY_JOINTS = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+
+# Camera orbit defaults (metres / seconds), used by the 'orbit' command.
+ORBIT_CENTER = (0.509, -0.005, 0.1)   # object being filmed
+ORBIT_RADIUS = 0.18                   # horizontal camera distance from the object (far side)
+ORBIT_NEAR_RADIUS = 0.12              # ...on the robot's side: the path is an oval, since a wide
+                                      # circle there makes the elbow fold up (self-collision stop)
+ORBIT_HEIGHT = 0.20                   # camera height above the object -> 48-59 deg look-down
+ORBIT_SECONDS = 40.0                  # one full lap; slower = sharper frames
 
 
 class FrankaMoveItClient(Node):
@@ -51,6 +64,18 @@ class FrankaMoveItClient(Node):
         self.declare_parameter('velocity_scaling', 0.1)       # 0..1, start slow
         self.declare_parameter('acceleration_scaling', 0.1)
         self.declare_parameter('planning_time', 5.0)
+        # Camera held in the gripper: which end-effector axis the lens looks along, and where
+        # the lens is in the end-effector frame (metres). Change live with the 'cam' command.
+        # Default: iPhone 17 held vertically and upside down, gripped across its width at the
+        # bottom end, so the lens hangs ~12 cm beyond the fingertips (TCP +z), on the back face,
+        # looking away from the robot in the ready pose. Measure and adjust with 'cam'.
+        # (Flat phone with the lens facing down = '+z', but it folds the elbow.)
+        self.declare_parameter('camera_axis', '+x')
+        self.declare_parameter('camera_offset', [0.004, 0.0, 0.12])
+        self.camera_axis = self.get_parameter('camera_axis').value
+        self.camera_offset = [float(v) for v in self.get_parameter('camera_offset').value]
+        if self.camera_axis not in AXES:
+            raise ValueError(f'camera_axis must be one of {list(AXES)}')
 
         self.group = self.get_parameter('group').value
         self.ee_link = self.get_parameter('ee_link').value
@@ -65,12 +90,27 @@ class FrankaMoveItClient(Node):
         self.cartesian_client = self.create_client(GetCartesianPath, 'compute_cartesian_path')
         self.execute_client = ActionClient(self, ExecuteTrajectory, 'execute_trajectory')
 
+        # Latest arm joint angles, needed to start a pre-planned joint trajectory exactly here.
+        self.joint_names = [self.base_frame.replace('link0', f'joint{i}') for i in range(1, 8)]
+        self.joint_positions = {}
+        self.create_subscription(JointState, '/joint_states', self._on_joint_state, 10)
+
         self.declare_parameter('gripper_ns', '/franka_gripper')
         gripper_ns = self.get_parameter('gripper_ns').value.rstrip('/')
         if Grasp is not None:
             self.grasp_client = ActionClient(self, Grasp, f'{gripper_ns}/grasp')
             self.gripper_move_client = ActionClient(self, GripperMove, f'{gripper_ns}/move')
             self.homing_client = ActionClient(self, Homing, f'{gripper_ns}/homing')
+
+    def _on_joint_state(self, msg):
+        self.joint_positions.update(zip(msg.name, msg.position))
+
+    def current_joints(self):
+        """Current 7 arm joint angles, or None if /joint_states has not arrived yet."""
+        try:
+            return [self.joint_positions[n] for n in self.joint_names]
+        except KeyError:
+            return None
 
     def current_pose(self):
         """Current ee_link pose in base_frame from TF, or None if not available yet."""
@@ -380,6 +420,66 @@ class FrankaMoveItClient(Node):
             ('Lifting', lambda: self.move_cartesian_path([above])),
         ])
 
+    # ---------------- Camera orbit ----------------
+
+    def orbit_plan(self, center=ORBIT_CENTER, radius=ORBIT_RADIUS, height=ORBIT_HEIGHT,
+                   near_radius=ORBIT_NEAR_RADIUS):
+        """Plan the whole orbit in joint space (see orbit_planner.py). Raises ValueError if unsafe.
+
+        near_radius < radius gives an oval that stays closer on the robot's side.
+        """
+        near_radius = None if near_radius is None or near_radius >= radius else near_radius
+        plan = plan_orbit(center, radius, height, self.camera_axis, self.camera_offset,
+                          q_now=self.current_joints(), near_radius=near_radius)
+        self._check_points([tuple(p) for p, _ in plan['poses']])
+        return plan
+
+    def orbit_go_to_start(self, plan):
+        """Collision-checked MoveIt move to the joint configuration where the loop starts."""
+        return self.move_to_joints(plan['q'][0].tolist())
+
+    def orbit_run(self, plan, duration=ORBIT_SECONDS):
+        """Execute the pre-planned loop as one smooth joint trajectory (about `duration` s)."""
+        q_now = self.current_joints()
+        if q_now is None:
+            raise RuntimeError('No /joint_states received; check ROS_DOMAIN_ID')
+        if max(abs(a - b) for a, b in zip(q_now, plan['q'][0])) > 0.05:
+            raise RuntimeError('Arm is not at the orbit start; run the orbit command again')
+        if not self.execute_client.wait_for_server(timeout_sec=5.0):
+            raise RuntimeError("Action 'execute_trajectory' not found; is move_group running?")
+
+        duration, times, pos, vel, acc = time_trajectory(plan['q'], duration)
+        # Start exactly where the arm is (MoveIt checks this): fade the small leftover offset
+        # from the start move out smoothly over the first seconds instead of in one jump.
+        delta = [a - b for a, b in zip(q_now, pos[0])]
+        fade = min(3.0, duration / 4)
+        for i, t in enumerate(times):
+            if t < fade:
+                w = 0.5 * (1 + math.cos(math.pi * t / fade))
+                dw = -0.5 * math.pi / fade * math.sin(math.pi * t / fade)
+                ddw = -0.5 * (math.pi / fade) ** 2 * math.cos(math.pi * t / fade)
+                pos[i] += [d * w for d in delta]
+                vel[i] += [d * dw for d in delta]
+                acc[i] += [d * ddw for d in delta]
+        goal = ExecuteTrajectory.Goal()
+        traj = goal.trajectory.joint_trajectory
+        traj.joint_names = self.joint_names
+        for t, p, v, a in zip(times, pos, vel, acc):
+            pt = JointTrajectoryPoint()
+            pt.positions, pt.velocities, pt.accelerations = p.tolist(), v.tolist(), a.tolist()
+            sec, nsec = divmod(int(round(t * 1e9)), 1_000_000_000)
+            pt.time_from_start.sec, pt.time_from_start.nanosec = sec, nsec
+            traj.points.append(pt)
+        print(f'  Lap time {duration:.0f} s')
+
+        result = self._run_action(self.execute_client, goal, 'execute_trajectory', duration + 30.0)
+        if result is None:
+            return False
+        if result.error_code.val != MoveItErrorCodes.SUCCESS:
+            self.get_logger().error(f'Orbit execution failed with error code {result.error_code.val}')
+            return False
+        return True
+
     @staticmethod
     def _slow_down(trajectory, scale):
         """Stretch a trajectory's timing by 1/scale (scale in 0..1)."""
@@ -423,7 +523,17 @@ def main(args=None):
           '  grasp width [force]   close on an object of that width (default 20 N)\n'
           '  pick x y z width      open, move above, lower, grasp, lift\n'
           '  place x y z           move above, lower, release, lift\n'
+          '  orbit [cx cy cz [r h [sec [near]]]]  move the camera around an object, aimed at it\n'
+          f'                        (default centre {ORBIT_CENTER}, r={ORBIT_RADIUS}, '
+          f'h={ORBIT_HEIGHT}, {ORBIT_SECONDS:.0f} s,\n'
+          f'                        near={ORBIT_NEAR_RADIUS} = radius on the robot side; '
+          'near=r for a circle)\n'
+          '  cam [axis [ox oy oz]] show/set the gripper axis the lens faces (+x,-x,+y,-y,+z,-z)\n'
+          '                        and the lens offset from the gripper TCP (metres)\n'
           '  q                     quit')
+    print(f'Camera: lens looks along {node.camera_axis}, offset {node.camera_offset}')
+    print('NOTE: the planner does not see the object, the table or the phone; first runs slow, '
+          'hand on the user stop.')
     gripper_cmds = ('home', 'open', 'grasp', 'pick', 'place')
     try:
         while rclpy.ok():
@@ -438,6 +548,57 @@ def main(args=None):
                     print(f'Rejected: {e}')
                 continue
             parts = line.split()
+            if parts and parts[0] == 'cam':
+                try:
+                    if len(parts) not in (1, 2, 5) or (len(parts) > 1 and parts[1] not in AXES):
+                        raise ValueError(f'usage: cam [axis [ox oy oz]], axis one of {list(AXES)}')
+                    if len(parts) > 1:
+                        node.camera_axis = parts[1]
+                    if len(parts) == 5:
+                        node.camera_offset = [float(v) for v in parts[2:5]]
+                    print(f'Camera: lens looks along {node.camera_axis}, '
+                          f'offset {node.camera_offset}')
+                except ValueError as e:
+                    print(f'Rejected: {e}')
+                continue
+            if parts and parts[0] == 'orbit':
+                try:
+                    vals = [float(a) for a in parts[1:]]
+                    if len(vals) not in (0, 3, 5, 6, 7):
+                        raise ValueError('usage: orbit [cx cy cz [radius height [seconds '
+                                         '[near_radius]]]]')
+                    center = tuple(vals[0:3]) if vals else ORBIT_CENTER
+                    radius, height = vals[3:5] if len(vals) >= 5 else (ORBIT_RADIUS, ORBIT_HEIGHT)
+                    seconds = vals[5] if len(vals) >= 6 else ORBIT_SECONDS
+                    near = min(vals[6] if len(vals) == 7 else ORBIT_NEAR_RADIUS, radius)
+                    shape = (f'radius {radius:.3f} m' if near >= radius else
+                             f'oval {near:.3f} m (robot side) to {radius:.3f} m')
+                    tilt = (f'{math.degrees(math.atan2(height, near)):.0f} deg' if near >= radius
+                            else f'{math.degrees(math.atan2(height, radius)):.0f}-'
+                                 f'{math.degrees(math.atan2(height, near)):.0f} deg')
+                    print(f'Orbit around {center}: {shape}, {height:.3f} m above, '
+                          f'looking down {tilt}, camera {node.camera_axis}')
+                    print('  Planning (checking camera rolls and arm configurations) ...')
+                    plan = node.orbit_plan(center, radius, height, near)
+                    print(f'  Found a safe loop: closest joint limit {plan["margin"]:.2f} rad, '
+                          f'largest joint turn to reach the start '
+                          f'{math.degrees(plan["start_move"]):.0f} deg')
+                    print('  Moving to start pose ...')
+                    if not node.orbit_go_to_start(plan):
+                        print('  Could not reach the start pose (see log above).')
+                        continue
+                    answer = input('  At start. Check the camera points at the object, start '
+                                   'recording, then press Enter to orbit (q to cancel): ')
+                    if answer.strip().lower() == 'q':
+                        print('  Orbit cancelled.')
+                        continue
+                    print('  Orbiting ...')
+                    ok = node.orbit_run(plan, seconds)
+                    print('Done.' if ok else 'Orbit failed (see log above). Try a larger height, '
+                          'a smaller radius, or check the camera axis.')
+                except (ValueError, RuntimeError) as e:
+                    print(f'Rejected: {e}')
+                continue
             if parts and parts[0] in gripper_cmds:
                 cmd, args = parts[0], parts[1:]
                 try:
