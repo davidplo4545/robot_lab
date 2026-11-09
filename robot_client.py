@@ -29,6 +29,8 @@ HELP = f'''Commands (metres):
                         (default centre {camera_orbit.CENTER}, r={camera_orbit.RADIUS}, \
 h={camera_orbit.HEIGHT}, {camera_orbit.SECONDS:.0f} s,
                         near={camera_orbit.NEAR_RADIUS} = radius on the robot side; near=r for a circle)
+  orbit halves [same args]  the same as two overlapping half-laps, picture kept upright
+                        (preview first: python orbit_preview.py ... --halves)
   cam [axis [ox oy oz]] show/set the gripper axis the lens faces (+x,-x,+y,-y,+z,-z)
                         and the lens offset from the gripper TCP (metres)
   q                     quit'''
@@ -119,9 +121,13 @@ class Console:
         print(f'Camera: lens looks along {self.camera_axis}, offset {self.camera_offset}')
 
     def cmd_orbit(self, words):
+        halves = bool(words) and words[0] == 'halves'
+        if halves:
+            words = words[1:]
         vals = [float(w) for w in words]
         if len(vals) not in (0, 3, 5, 6, 7):
-            raise ValueError('usage: orbit [cx cy cz [radius height [seconds [near_radius]]]]')
+            raise ValueError('usage: orbit [halves] [cx cy cz [radius height [seconds '
+                             '[near_radius]]]]')
         center = tuple(vals[0:3]) if vals else camera_orbit.CENTER
         radius, height = vals[3:5] if len(vals) >= 5 else (camera_orbit.RADIUS, camera_orbit.HEIGHT)
         seconds = vals[5] if len(vals) >= 6 else camera_orbit.SECONDS
@@ -133,6 +139,9 @@ class Console:
                      f'{math.degrees(math.atan2(height, near)):.0f} deg')
         print(f'Orbit around {center}: {shape}, {height:.3f} m above, '
               f'looking down {tilt}, camera {self.camera_axis}')
+        if halves:
+            self.orbit_halves(center, radius, height, seconds, near)
+            return
         print('  Planning (checking camera rolls and arm configurations) ...')
         orbit = camera_orbit.plan(self.robot, center, radius, height, near,
                                   self.camera_axis, self.camera_offset)
@@ -151,6 +160,31 @@ class Console:
         ok = camera_orbit.run(self.robot, orbit, seconds)
         print('Done.' if ok else 'Orbit failed (see log above). Try a larger height, '
               'a smaller radius, or check the camera axis.')
+
+    def orbit_halves(self, center, radius, height, seconds, near):
+        """Two upright half-laps: the picture doesn't rotate (see orbit_preview.py --halves)."""
+        print('  Two half-laps with an upright picture. Planning (about a minute) ...')
+        halves = camera_orbit.plan_halves(self.robot, center, radius, height, near,
+                                          self.camera_axis, self.camera_offset)
+        for i, arc in enumerate(halves['arcs']):
+            end = (arc['start_deg'] + arc['span_deg']) % 360
+            print(f'  Half {i + 1}: {arc["start_deg"] % 360:.0f} -> {end:.0f} deg around the '
+                  f'object, closest joint limit {arc["margin"]:.2f} rad')
+        if not halves['transition_ok']:
+            print('  Warning: a straight move between the halves would fold the elbow or dip '
+                  'the camera; MoveIt plans its own path, but watch that move.')
+        print('  Moving to the start of half 1 ...')
+        if not camera_orbit.go_to_start(self.robot, halves['arcs'][0]):
+            print('  Could not reach the start pose (see log above).')
+            return
+        answer = input('  At start. Check the camera points at the object, start recording, '
+                       'then press Enter (q to cancel). The arm pauses between the halves to '
+                       'move back: keep recording, or trim later: ')
+        if answer.strip().lower() == 'q':
+            print('  Orbit cancelled.')
+            return
+        ok = camera_orbit.run_halves(self.robot, halves, seconds)
+        print('Done.' if ok else 'Orbit failed (see log above).')
 
     def move_xyz(self, words):
         try:

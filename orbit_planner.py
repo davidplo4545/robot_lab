@@ -245,3 +245,115 @@ def plan_orbit(center, radius, height, camera_axis='+x', camera_offset=(0, 0, 0)
             return {'q': qs, 'poses': poses, 'roll': np.array(roll_seq), 'margin': _margin_all(qs),
                     'start_move': float(np.max(np.abs(qs[0] - here)))}
     raise ValueError('orbit refinement failed; try a smaller radius or a larger height')
+
+
+# ---------------- Upright video: two half-laps ----------------
+
+def upright_roll0(center, radius, height, camera_axis, start_deg, flip, near_radius=None):
+    """Roll offset r0 such that roll = theta + r0 keeps the horizon level (TCP y horizontal).
+
+    flip=False: gripper z points downward-ish (the usual way); True: upward-ish."""
+    best = None
+    for r0 in np.radians(np.arange(0.0, 360.0, 0.25)):
+        th = math.radians(start_deg)
+        _, R = orbit_poses(center, radius, height, camera_axis, (0, 0, 0), roll=th + r0, n=1,
+                           start_deg=start_deg, span_deg=0.0, near_radius=near_radius)[0]
+        if (R[2, 2] > 0) != flip:
+            continue
+        tilt = abs(R[2, 1])                 # world-z component of TCP y: 0 = level horizon
+        if best is None or tilt < best[0]:
+            best = (tilt, r0)
+    return best[1]
+
+
+def upright_poses(center, radius, height, camera_axis, camera_offset, start_deg, span_deg, n,
+                  flip=False, near_radius=None):
+    """Arc of poses looking at `center` with a level horizon (the picture doesn't rotate)."""
+    r0 = upright_roll0(center, radius, height, camera_axis, start_deg, flip, near_radius)
+    thetas = np.radians(start_deg + span_deg * np.arange(n + 1) / n)
+    return orbit_poses(center, radius, height, camera_axis, camera_offset, roll=thetas + r0, n=n,
+                       start_deg=start_deg, span_deg=span_deg, near_radius=near_radius)
+
+
+def horizon_tilt_deg(R, camera_axis='+x'):
+    """Sideways tilt of the picture (deg): angle of TCP y out of the horizontal."""
+    return math.degrees(math.asin(min(1.0, abs(R[2, 1]))))
+
+
+def _plan_arc(poses, seeds, rng, n_random=120):
+    """Best continuous IK path along fixed poses: (min margin, qs) or None."""
+    lo, hi = FR3_LOWER + LIMIT_PAD, FR3_UPPER - LIMIT_PAD
+    starts = []
+    for seed in list(seeds) + [rng.uniform(lo, hi) for _ in range(n_random)]:
+        q, ok = ik(*poses[0], seed)
+        if ok and _config_ok(q) and all(np.max(np.abs(q - s)) > 0.05 for s in starts):
+            starts.append(q)
+    best = None
+    for q0 in starts:
+        qs, worst = [q0], _margin(q0)
+        for p, R in poses[1:]:
+            q, ok = ik(p, R, qs[-1], reg=0.02)
+            if not ok or np.max(np.abs(q - qs[-1])) > 0.15 or not _config_ok(q):
+                qs = None
+                break
+            qs.append(q)
+            worst = min(worst, _margin(q))
+        if qs is not None and (best is None or worst > best[0]):
+            best = (worst, np.array(qs))
+    return best
+
+
+def plan_upright_halves(center, radius, height, camera_axis='+x', camera_offset=(0, 0, 0),
+                        q_now=None, near_radius=None, overlap_deg=10.0, step_deg=2.5,
+                        split_angles=range(0, 360, 30), rng_seed=0):
+    """Two overlapping half-laps that together cover 360 deg with a level horizon.
+
+    A full lap with an upright picture is impossible for any arm with joint limits (the camera
+    would have to turn a full 360 deg about the vertical and end where it started), but each
+    half only turns ~190 deg. Between the halves the arm moves back to the second half's start
+    (MoveIt plans that move at run time). Tries several split angles and both ways up; returns
+    the split whose worse half stays furthest from the joint limits:
+      {'arcs': [{'q', 'poses', 'margin', 'start_deg', 'span_deg'} x2], 'flip', 'margin',
+       'start_move' (rad, from q_now), 'transition_ok'}
+    """
+    rng = np.random.default_rng(rng_seed)
+    here = np.asarray(q_now if q_now is not None else READY_JOINTS, dtype=float)
+    span = 180.0 + overlap_deg
+    n = max(2, int(round(span / step_deg)))
+    min_z = min(START_MOVE_MIN_Z, center[2] + height - 0.05)
+    cache = {}
+
+    def arc(start, flip):
+        key = (start % 360, flip)
+        if key not in cache:
+            poses = upright_poses(center, radius, height, camera_axis, camera_offset,
+                                  start - overlap_deg / 2, span, n, flip, near_radius)
+            res = _plan_arc(poses, [here, READY_JOINTS], rng)
+            cache[key] = None if res is None else {
+                'q': res[1], 'poses': poses, 'margin': res[0],
+                'start_deg': start - overlap_deg / 2, 'span_deg': span}
+        return cache[key]
+
+    best = None
+    for flip in (False, True):
+        for s in split_angles:
+            a, b = arc(s, flip), arc(s + 180, flip)
+            if a is None or b is None:
+                continue
+            for first, second in ((a, b), (b, a)):
+                if not (_start_move_ok(here, first['q'][0])
+                        and _start_move_low_point(here, first['q'][0], camera_offset) >= min_z):
+                    continue
+                trans_ok = (_start_move_ok(first['q'][-1], second['q'][0]) and
+                            _start_move_low_point(first['q'][-1], second['q'][0],
+                                                  camera_offset) >= min_z)
+                score = (trans_ok, min(first['margin'], second['margin']),
+                         -float(np.max(np.abs(first['q'][0] - here))))
+                if best is None or score > best[0]:
+                    best = (score, {'arcs': [first, second], 'flip': flip,
+                                    'margin': score[1], 'start_move': -score[2],
+                                    'transition_ok': trans_ok})
+    if best is None:
+        raise ValueError('no pair of upright half-laps found: try a smaller radius or a larger '
+                         'height')
+    return best[1]
