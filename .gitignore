@@ -1,7 +1,8 @@
-# Upload only Python scripts
+# Upload only Python scripts and docs
 *
 !*/
 !*.py
+!*.md
 !.gitignore
 __pycache__/
 test_env/

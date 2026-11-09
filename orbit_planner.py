@@ -6,132 +6,25 @@ limit (or flips the wrist) part-way round. Instead, this module:
   1. builds the circle of camera poses for several camera roll angles,
   2. solves inverse kinematics continuously around the loop from several start configurations,
   3. keeps the loop that stays furthest from the joint limits,
-  4. turns it into a smooth, timed joint trajectory (gentle ramp up / constant speed / ramp down).
+  4. turns it into a smooth, timed joint trajectory (fr3.trajectory.time_trajectory).
 
+Project-specific. The robot model (FK/IK/limits) lives in the reusable fr3 package.
 Needs numpy and scipy. No ROS imports, so it can be tested offline.
 """
 import math
 
 import numpy as np
 
-# FR3 kinematics (Franka's modified DH: a, d, alpha per joint), flange and hand TCP.
-_DH = [(0.0, 0.333, 0.0), (0.0, 0.0, -math.pi / 2), (0.0, 0.316, math.pi / 2),
-       (0.0825, 0.0, math.pi / 2), (-0.0825, 0.384, -math.pi / 2), (0.0, 0.0, math.pi / 2),
-       (0.088, 0.0, math.pi / 2)]
-_FLANGE_D = 0.107      # link7 -> link8 (flange)
-_TCP_D = 0.1034        # flange -> fr3_hand_tcp (between the fingertips)
-_TCP_YAW = -math.pi / 4
+from fr3.kinematics import (LIMIT_PAD, LOWER as FR3_LOWER, MIN_WRIST_TO_UPPER_ARM,
+                            READY_JOINTS, UPPER as FR3_UPPER, clear_of_table as _clear_of_table,
+                            fk, ik, joint_margin, rot_between, rot_z, wrist_to_upper_arm)
 
-# FR3 joint position limits (rad), current Franka spec.
-FR3_LOWER = np.array([-2.9007, -1.8361, -2.9007, -3.0770, -2.8763, 0.4398, -3.0508])
-FR3_UPPER = np.array([2.9007, 1.8361, 2.9007, -0.1169, 2.8763, 4.6216, 3.0508])
-LIMIT_PAD = 0.05       # never plan closer than this to a limit (rad)
-MIN_MARGIN = 0.10      # reject loops that come closer than this to a limit (rad)
+MIN_MARGIN = 0.10      # reject loops that come closer than this to a joint limit (rad)
 GOOD_MARGIN = 0.15     # among loops at least this safe, prefer the one closest to the current arm pose
 START_MOVE_MIN_Z = 0.25  # gripper and lens stay at least this high (m) while moving to the start
-# The FR3 firmware stops with 'self_collision_avoidance_violation' when the elbow folds so far that
-# the wrist comes near the upper arm (observed: stopped at 0.295 m; ready pose is 0.40 m).
-MIN_WRIST_TO_UPPER_ARM = 0.35
-MAX_JOINT_VEL = 0.5    # rad/s, well under the FR3 limits; slower lap if needed
-MAX_JOINT_ACC = 1.0    # rad/s^2
-
-READY_JOINTS = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
 
 AXES = {'+x': (1, 0, 0), '-x': (-1, 0, 0), '+y': (0, 1, 0),
         '-y': (0, -1, 0), '+z': (0, 0, 1), '-z': (0, 0, -1)}
-
-
-# ---------------- Small rotation helpers ----------------
-
-def _unit(v):
-    v = np.asarray(v, dtype=float)
-    return v / np.linalg.norm(v)
-
-
-def rot_between(a, b):
-    """Smallest rotation matrix that turns direction a onto direction b."""
-    a, b = _unit(a), _unit(b)
-    v, c = np.cross(a, b), float(np.dot(a, b))
-    if c < -0.999999:  # opposite directions: half turn about any perpendicular axis
-        axis = _unit(np.cross(a, (1, 0, 0) if abs(a[0]) < 0.9 else (0, 1, 0)))
-        return 2 * np.outer(axis, axis) - np.eye(3)
-    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
-    return np.eye(3) + vx + vx @ vx / (1 + c)
-
-
-def rot_z(phi):
-    c, s = math.cos(phi), math.sin(phi)
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
-
-
-def mat_to_quat(R):
-    """Rotation matrix -> (x, y, z, w)."""
-    w = math.sqrt(max(0.0, 1 + R[0, 0] + R[1, 1] + R[2, 2])) / 2
-    x = math.copysign(math.sqrt(max(0.0, 1 + R[0, 0] - R[1, 1] - R[2, 2])) / 2, R[2, 1] - R[1, 2])
-    y = math.copysign(math.sqrt(max(0.0, 1 - R[0, 0] + R[1, 1] - R[2, 2])) / 2, R[0, 2] - R[2, 0])
-    z = math.copysign(math.sqrt(max(0.0, 1 - R[0, 0] - R[1, 1] + R[2, 2])) / 2, R[1, 0] - R[0, 1])
-    return x, y, z, w
-
-
-# ---------------- Kinematics ----------------
-
-def _frames(q):
-    """World transforms of joint frames 1..7, then the TCP."""
-    T = np.eye(4)
-    out = []
-    for (a, d, alpha), th in zip(_DH, q):
-        ca, sa, ct, st = math.cos(alpha), math.sin(alpha), math.cos(th), math.sin(th)
-        T = T @ np.array([[ct, -st, 0, a],
-                          [st * ca, ct * ca, -sa, -d * sa],
-                          [st * sa, ct * sa, ca, d * ca],
-                          [0, 0, 0, 1]])
-        out.append(T)
-    tcp = np.eye(4)
-    tcp[:3, :3] = rot_z(_TCP_YAW)
-    tcp[2, 3] = _FLANGE_D + _TCP_D
-    out.append(T @ tcp)
-    return out
-
-
-def fk(q):
-    """TCP position and rotation for joint angles q."""
-    T = _frames(q)[-1]
-    return T[:3, 3].copy(), T[:3, :3].copy()
-
-
-def _jacobian(frames):
-    p = frames[-1][:3, 3]
-    J = np.zeros((6, 7))
-    for i in range(7):
-        z, o = frames[i][:3, 2], frames[i][:3, 3]
-        J[:3, i] = np.cross(z, p - o)
-        J[3:, i] = z
-    return J
-
-
-def ik(p_target, R_target, seed, reg=0.0, pos_tol=1e-3, ang_tol_deg=0.5):
-    """Bounded least-squares IK near `seed`. Returns (q, ok)."""
-    from scipy.optimize import least_squares
-    lo, hi = FR3_LOWER + LIMIT_PAD, FR3_UPPER - LIMIT_PAD
-    seed = np.clip(np.asarray(seed, dtype=float), lo + 1e-6, hi - 1e-6)
-    w_rot = 0.3  # metres per radian: weight of orientation vs position error
-
-    def residual(q):
-        fr = _frames(q)
-        p, R = fr[-1][:3, 3], fr[-1][:3, :3]
-        E = R_target @ R.T
-        rot_err = 0.5 * np.array([E[2, 1] - E[1, 2], E[0, 2] - E[2, 0], E[1, 0] - E[0, 1]])
-        return np.concatenate([p_target - p, w_rot * rot_err, reg * (q - seed)])
-
-    def jac(q):
-        J = _jacobian(_frames(q))
-        return np.vstack([-J[:3], -w_rot * J[3:], reg * np.eye(7)])
-
-    res = least_squares(residual, seed, jac=jac, bounds=(lo, hi), xtol=1e-12, ftol=1e-12,
-                        gtol=1e-12, max_nfev=200)
-    p, R = fk(res.x)
-    ang = math.degrees(math.acos(np.clip((np.trace(R_target @ R.T) - 1) / 2, -1, 1)))
-    return res.x, bool(np.linalg.norm(p - p_target) < pos_tol and ang < ang_tol_deg)
 
 
 # ---------------- Orbit geometry ----------------
@@ -180,24 +73,6 @@ def orbit_poses(center, radius, height, camera_axis='+x', camera_offset=(0, 0, 0
     return poses
 
 
-def _clear_of_table(qs, min_z=0.08):
-    """Elbow and wrist frames stay above the table for every configuration."""
-    return all(min(T[2, 3] for T in _frames(q)[2:]) > min_z for q in qs)
-
-
-def wrist_to_upper_arm(q):
-    """Distance (m) from the wrist/flange to the shoulder-elbow segment (elbow fold check)."""
-    fr = _frames(q)
-    shoulder, elbow = fr[0][:3, 3], fr[2][:3, 3]
-    flange = fr[6][:3, 3] + fr[6][:3, 2] * _FLANGE_D
-    ab = elbow - shoulder
-    best = np.inf
-    for p in (fr[4][:3, 3], fr[6][:3, 3], flange):
-        t = np.clip((p - shoulder) @ ab / (ab @ ab), 0.0, 1.0)
-        best = min(best, float(np.linalg.norm(p - (shoulder + t * ab))))
-    return best
-
-
 def _not_folded(qs):
     return all(wrist_to_upper_arm(q) >= MIN_WRIST_TO_UPPER_ARM for q in qs)
 
@@ -217,7 +92,11 @@ def _start_move_low_point(here, q0, camera_offset, samples=40):
 
 
 def _margin(q):
-    return float(np.min(np.minimum(np.asarray(q) - FR3_LOWER, FR3_UPPER - np.asarray(q))))
+    return joint_margin(q)
+
+
+def _margin_all(qs):
+    return joint_margin(qs)
 
 
 def _config_ok(q):
@@ -366,60 +245,3 @@ def plan_orbit(center, radius, height, camera_axis='+x', camera_offset=(0, 0, 0)
             return {'q': qs, 'poses': poses, 'roll': np.array(roll_seq), 'margin': _margin_all(qs),
                     'start_move': float(np.max(np.abs(qs[0] - here)))}
     raise ValueError('orbit refinement failed; try a smaller radius or a larger height')
-
-
-def _margin_all(qs):
-    return float(np.min(np.minimum(qs - FR3_LOWER, FR3_UPPER - qs)))
-
-
-# ---------------- Timing ----------------
-
-def time_trajectory(qs, duration, dt=0.05):
-    """Time the joint path: smooth ramp up, constant speed, smooth ramp down.
-
-    Stretches `duration` if needed to respect MAX_JOINT_VEL / MAX_JOINT_ACC.
-    Returns (duration, times, positions, velocities, accelerations).
-    """
-    from scipy.interpolate import CubicSpline
-    u = np.linspace(0.0, 1.0, len(qs))
-    spline = CubicSpline(u, qs, axis=0)
-    d1, d2 = spline.derivative(1), spline.derivative(2)
-    while True:
-        ramp = min(3.0, duration / 4)
-        vmax = 1.0 / (duration - ramp)  # path speed in u per second (cosine ramps)
-        t = np.arange(0.0, duration + 1e-9, dt)
-        if t[-1] < duration:
-            t = np.append(t, duration)
-
-        def speed(tt):
-            if tt < ramp:
-                return vmax * (1 - math.cos(math.pi * tt / ramp)) / 2
-            if tt > duration - ramp:
-                return vmax * (1 - math.cos(math.pi * (duration - tt) / ramp)) / 2
-            return vmax
-
-        def accel(tt):
-            if tt < ramp:
-                return vmax * math.pi / (2 * ramp) * math.sin(math.pi * tt / ramp)
-            if tt > duration - ramp:
-                return -vmax * math.pi / (2 * ramp) * math.sin(math.pi * (duration - tt) / ramp)
-            return 0.0
-
-        # Integrate path position u(t) finely, then sample.
-        fine = np.linspace(0.0, duration, int(duration * 200) + 1)
-        sp = np.array([speed(tt) for tt in fine])
-        uf = np.concatenate([[0.0], np.cumsum((sp[1:] + sp[:-1]) / 2 * np.diff(fine))])
-        uf /= uf[-1]
-        us = np.interp(t, fine, uf)
-        v = np.array([speed(tt) for tt in t])
-        a = np.array([accel(tt) for tt in t])
-        pos = spline(us)
-        vel = d1(us) * v[:, None]
-        acc = d2(us) * (v ** 2)[:, None] + d1(us) * a[:, None]
-        vel[0] = vel[-1] = 0.0
-        acc[-1] = 0.0
-        scale = max(np.max(np.abs(vel)) / MAX_JOINT_VEL,
-                    math.sqrt(np.max(np.abs(acc)) / MAX_JOINT_ACC))
-        if scale <= 1.0:
-            return duration, t, pos, vel, acc
-        duration *= scale * 1.05
